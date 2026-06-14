@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gated-Access Meeting Scheduling</title>
+<style>
+  :root { --free:#1f9d55; --busy:#cbd5e0; --chosen:#f6c343; --ink:#1a202c; --muted:#718096; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:#f7fafc; color:var(--ink);
+         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  main { max-width: 980px; margin: 0 auto; padding: 32px 20px 64px; }
+  h1 { margin:0 0 4px; font-size: 1.7rem; }
+  .sub { color:var(--muted); margin:0 0 24px; }
+  h2 { font-size: 1.15rem; margin: 32px 0 8px; }
+  h3 { font-size: 1rem; margin: 0 0 8px; }
+  .tag { font-weight:400; font-size:.72rem; color:var(--muted); border:1px solid #e2e8f0;
+         padding:2px 8px; border-radius:999px; margin-left:8px; }
+  .banner { border-radius:12px; padding:18px 20px; margin:8px 0 8px; }
+  .banner.ok { background:#e6fffa; border:1px solid #38b2ac; }
+  .banner.none { background:#fff5f5; border:1px solid #fc8181; color:#9b2c2c; font-weight:600; }
+  .banner-label { text-transform:uppercase; letter-spacing:.08em; font-size:.7rem; color:var(--muted); }
+  .banner-time { font-size:1.5rem; font-weight:700; margin:2px 0; }
+  .banner-note { color:var(--muted); font-size:.9rem; }
+  .revealed { display:flex; flex-wrap:wrap; gap:8px; list-style:none; padding:0; }
+  .revealed li { background:#fffbea; border:1px solid var(--chosen); border-radius:8px; padding:6px 10px; font-variant-numeric:tabular-nums; }
+  .revealed li.muted { background:#edf2f7; border-color:#e2e8f0; color:var(--muted); }
+  .round { margin:10px 0 16px; padding:12px 14px; border:1px solid #e2e8f0; border-radius:12px; background:#fff; }
+  .round.winner { border-color:var(--chosen); background:#fffdf5; }
+  .round .meta { font-size:.78rem; color:var(--muted); margin:8px 0 0; }
+  .scroll { overflow-x:auto; border:1px solid #e2e8f0; border-radius:10px; }
+  table.timeline { border-collapse:collapse; font-size:.8rem; }
+  table.timeline th, table.timeline td { border:1px solid #edf2f7; text-align:center; padding:6px 8px; min-width:46px; }
+  table.timeline th.rowhead { text-align:right; position:sticky; left:0; background:#fff; font-weight:600; min-width:120px; }
+  table.timeline th.firstofday { border-left:2px solid #cbd5e0; }
+  td.firstofday, td.free.firstofday, td.busy.firstofday { border-left:2px solid #cbd5e0; }
+  .day { font-size:.65rem; color:var(--muted); }
+  .time { font-variant-numeric:tabular-nums; }
+  td.free { background:#e9f8ef; color:var(--free); font-weight:700; }
+  td.busy { background:#f2f4f7; color:#a0aec0; }
+  td.common { background:#e9f8ef; color:var(--free); font-weight:700; }
+  td.nocommon { background:#fff; color:#cbd5e0; }
+  .interrow th, .interrow td { border-top:2px solid #cbd5e0; }
+  th.chosen, td.chosen { outline:3px solid var(--chosen); outline-offset:-3px; }
+  .legend { font-size:.8rem; color:var(--muted); margin-top:8px; }
+  .swatch { display:inline-block; width:12px; height:12px; border-radius:3px; vertical-align:middle; }
+  .swatch.free { background:#e9f8ef; border:1px solid var(--free); }
+  .swatch.busy { background:#f2f4f7; border:1px solid #cbd5e0; }
+  .swatch.chosen { background:#fffbea; border:2px solid var(--chosen); }
+  table.trace { border-collapse:collapse; width:100%; font-size:.82rem; }
+  table.trace th, table.trace td { border-bottom:1px solid #edf2f7; padding:7px 8px; text-align:left; vertical-align:top; }
+  table.trace th { color:var(--muted); font-weight:600; }
+  tr.cleartext { background:#fffbea; }
+  .badge { font-size:.72rem; padding:2px 8px; border-radius:999px; white-space:nowrap; }
+  .badge.opaque { background:#edf2f7; color:#4a5568; }
+  .badge.reveal { background:#fffbea; color:#975a16; border:1px solid var(--chosen); }
+  .notes { background:#fff; border:1px solid #e2e8f0; border-radius:10px; padding:8px 20px; }
+  .notes li { margin:6px 0; }
+  .muted { color:var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Gated-Access Meeting Scheduling</h1>
+  <p class="sub">Privacy-preserving scheduling via multi-party Private Set Intersection</p>
+
+  <div class="banner ok">
+    <div class="banner-label">Proposed meeting</div>
+    <div class="banner-time">Mon Jun 15, 14:00 &rarr; Mon Jun 15, 15:00</div>
+    <div class="banner-note">1 contiguous slot(s), free for all 3 parties &mdash; required flexibility: <strong>easy reschedules</strong></div>
+  </div>
+
+  <section>
+    <h2>What the protocol revealed</h2>
+    <p>Each round discloses only its own intersection; the winning round revealed the 1 slot(s) everyone is free for:</p>
+    <ul class="revealed">
+<li>Mon Jun 15, 14:00</li>    </ul>
+  </section>
+
+  <section>
+    <h2>Escalating rounds <span class="tag">ground truth &mdash; illustration only; the protocol never reveals this</span></h2>
+    <p>Each round re-runs the PSI with more meetings freed. The first round that finds a slot wins, so only the cheapest meetings that were necessary get disturbed.</p>
+    <div class="round ">
+      <h3>Round 1 &mdash; no rescheduling
+        <span class="badge opaque">no common slot</span>
+      </h3>
+      <div class="scroll">
+  <table class="timeline">
+    <thead>
+      <tr>
+        <th class="rowhead"></th>
+        <th class="firstofday ">
+<div class="day">Mon Jun 15</div>          <div class="time">09:00</div>
+        </th>
+        <th class=" ">
+          <div class="time">10:00</div>
+        </th>
+        <th class=" ">
+          <div class="time">11:00</div>
+        </th>
+        <th class=" ">
+          <div class="time">12:00</div>
+        </th>
+        <th class=" ">
+          <div class="time">13:00</div>
+        </th>
+        <th class=" ">
+          <div class="time">14:00</div>
+        </th>
+        <th class=" ">
+          <div class="time">15:00</div>
+        </th>
+        <th class=" ">
+          <div class="time">16:00</div>
+        </th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <th class="rowhead">Alice</th>
+        <td class="busy " title="Mon 09:00">×</td>
+        <td class="busy " title="Mon 10:00">×</td>
+        <td class="busy " title="Mon 11:00">×</td>
+        <td class="free " title="Mon 12:00">·</td>
+        <td class="busy " title="Mon 13:00">×</td>
+        <td class="busy " title="Mon 14:00">×</td>
+        <td class="busy " title="Mon 15:00">×</td>
+        <td class="busy " title="Mon 16:00">×</td>
+      </tr>
+      <tr>
+        <th class="rowhead">Bob</th>
+        <td class="busy " title="Mon 09:00">×</td>
+        <td class="busy " title="Mon 10:00">×</td>
+        <td class="free " title="Mon 11:00">·</td>
+        <td class="busy " title="Mon 12:00">×</td>
+        <td class="busy " title="Mon 13:00">×</td>
+        <td class="free " title="Mon 14:00">·</td>
+        <td class="busy " title="Mon 15:00">×</td>
+        <td class="busy " title="Mon 16:00">×</td>
+      </tr>
+      <tr>
+        <th class="rowhead">Carol</th>
+        <td class="busy " title="Mon 09:00">×</td>
+        <td class="free " title="Mon 10:00">·</td>
+        <td class="busy " title="Mon 11:00">×</td>
+        <td class="busy " title="Mon 12:00">×</td>
+        <td class="busy " title="Mon 13:00">×</td>
+        <td class="free " title="Mon 14:00">·</td>
+        <td class="busy " title="Mon 15:00">×</td>
+        <td class="busy " title="Mon 16:00">×</td>
+      </tr>
+      <tr class="interrow">
+        <th class="rowhead">Everyone free?</th>
+        <td class="nocommon "></td>
+        <td class="nocommon "></td>
+        <td class="nocommon "></td>
+        <td class="nocommon "></td>
+        <td class="nocommon "></td>
+        <td class="nocommon "></td>
+        <td class="nocommon "></td>
+        <td class="nocommon "></td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+      <p class="meta">Free-slot counts the Combiner sees this round &mdash; Alice: 1, Bob: 2, Carol: 2.</p>
+    </div>
+    <div class="round winner">
+      <h3>Round 2 &mdash; easy reschedules
+        <span class="badge reveal">match &amp;mdash; winner</span>
+      </h3>
+      <div class="scroll">
+  <table class="timeline">
+    <thead>
+      <tr>
+        <th class="rowhead"></th>
+        <th class="firstofday ">
+<div class="day">Mon Jun 15</div>          <div class="time">09:00</div>
+        </th>
+        <th class=" ">
+          <div class="time">10:00</div>
+        </th>
+        <th class=" ">
+          <div class="time">11:00</div>
+        </th>
+        <th class=" ">
+          <div class="time">12:00</div>
+        </th>
+        <th class=" ">
+          <div class="time">13:00</div>
+        </th>
+        <th class=" chosen">
+          <div class="time">14:00</div>
+        </th>
+        <th class=" ">
+          <div class="time">15:00</div>
+        </th>
+        <th class=" ">
+          <div class="time">16:00</div>
+        </th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <th class="rowhead">Alice</th>
+        <td class="busy " title="Mon 09:00">×</td>
+        <td class="busy " title="Mon 10:00">×</td>
+        <td class="busy " title="Mon 11:00">×</td>
+        <td class="free " title="Mon 12:00">·</td>
+        <td class="busy " title="Mon 13:00">×</td>
+        <td class="free chosen" title="Mon 14:00">·</td>
+        <td class="busy " title="Mon 15:00">×</td>
+        <td class="busy " title="Mon 16:00">×</td>
+      </tr>
+      <tr>
+        <th class="rowhead">Bob</th>
+        <td class="busy " title="Mon 09:00">×</td>
+        <td class="busy " title="Mon 10:00">×</td>
+        <td class="free " title="Mon 11:00">·</td>
+        <td class="busy " title="Mon 12:00">×</td>
+        <td class="busy " title="Mon 13:00">×</td>
+        <td class="free chosen" title="Mon 14:00">·</td>
+        <td class="busy " title="Mon 15:00">×</td>
+        <td class="busy " title="Mon 16:00">×</td>
+      </tr>
+      <tr>
+        <th class="rowhead">Carol</th>
+        <td class="busy " title="Mon 09:00">×</td>
+        <td class="free " title="Mon 10:00">·</td>
+        <td class="busy " title="Mon 11:00">×</td>
+        <td class="busy " title="Mon 12:00">×</td>
+        <td class="busy " title="Mon 13:00">×</td>
+        <td class="free chosen" title="Mon 14:00">·</td>
+        <td class="busy " title="Mon 15:00">×</td>
+        <td class="busy " title="Mon 16:00">×</td>
+      </tr>
+      <tr class="interrow">
+        <th class="rowhead">Everyone free?</th>
+        <td class="nocommon "></td>
+        <td class="nocommon "></td>
+        <td class="nocommon "></td>
+        <td class="nocommon "></td>
+        <td class="nocommon "></td>
+        <td class="common chosen">✓</td>
+        <td class="nocommon "></td>
+        <td class="nocommon "></td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+      <p class="meta">Free-slot counts the Combiner sees this round &mdash; Alice: 2, Bob: 2, Carol: 2.</p>
+    </div>
+    <p class="legend">
+      <span class="swatch free"></span> free &nbsp;
+      <span class="swatch busy"></span> busy &nbsp;
+      <span class="swatch chosen"></span> chosen meeting
+    </p>
+  </section>
+
+  <section>
+    <h2>What must move <span class="tag">each party computes its own &mdash; no one sees another's</span></h2>
+    <ul class="notes">
+      <li><strong>Alice</strong> reschedules: &ldquo;1:1 with Ben&rdquo; (easy, Mon Jun 15, 14:00)</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Protocol trace</h2>
+    <p>The winning round's messages. Only opaque blinded points cross the wire until the very last step &mdash; no party's calendar is ever sent in the clear.</p>
+    <table class="trace">
+      <thead><tr><th>#</th><th>From</th><th>To</th><th>Step</th><th>Payload</th></tr></thead>
+      <tbody>
+        <tr class="">
+          <td>0</td>
+          <td>Alice</td>
+          <td>ring</td>
+          <td>Alice blinds its 2 free slots with its own key</td>
+          <td>
+<span class="badge opaque">2 blinded point(s)</span>          </td>
+        </tr>
+        <tr class="">
+          <td>1</td>
+          <td>Bob</td>
+          <td>ring</td>
+          <td>Bob re-blinds Alice&#39;s set with its key</td>
+          <td>
+<span class="badge opaque">2 blinded point(s)</span>          </td>
+        </tr>
+        <tr class="">
+          <td>2</td>
+          <td>Carol</td>
+          <td>ring</td>
+          <td>Carol re-blinds Alice&#39;s set with its key</td>
+          <td>
+<span class="badge opaque">2 blinded point(s)</span>          </td>
+        </tr>
+        <tr class="">
+          <td>3</td>
+          <td>Alice</td>
+          <td>Combiner</td>
+          <td>Alice submits its fully-blinded set to the Combiner</td>
+          <td>
+<span class="badge opaque">2 blinded point(s)</span>          </td>
+        </tr>
+        <tr class="">
+          <td>4</td>
+          <td>Bob</td>
+          <td>ring</td>
+          <td>Bob blinds its 2 free slots with its own key</td>
+          <td>
+<span class="badge opaque">2 blinded point(s)</span>          </td>
+        </tr>
+        <tr class="">
+          <td>5</td>
+          <td>Alice</td>
+          <td>ring</td>
+          <td>Alice re-blinds Bob&#39;s set with its key</td>
+          <td>
+<span class="badge opaque">2 blinded point(s)</span>          </td>
+        </tr>
+        <tr class="">
+          <td>6</td>
+          <td>Carol</td>
+          <td>ring</td>
+          <td>Carol re-blinds Bob&#39;s set with its key</td>
+          <td>
+<span class="badge opaque">2 blinded point(s)</span>          </td>
+        </tr>
+        <tr class="">
+          <td>7</td>
+          <td>Bob</td>
+          <td>Combiner</td>
+          <td>Bob submits its fully-blinded set to the Combiner</td>
+          <td>
+<span class="badge opaque">2 blinded point(s)</span>          </td>
+        </tr>
+        <tr class="">
+          <td>8</td>
+          <td>Carol</td>
+          <td>ring</td>
+          <td>Carol blinds its 2 free slots with its own key</td>
+          <td>
+<span class="badge opaque">2 blinded point(s)</span>          </td>
+        </tr>
+        <tr class="">
+          <td>9</td>
+          <td>Alice</td>
+          <td>ring</td>
+          <td>Alice re-blinds Carol&#39;s set with its key</td>
+          <td>
+<span class="badge opaque">2 blinded point(s)</span>          </td>
+        </tr>
+        <tr class="">
+          <td>10</td>
+          <td>Bob</td>
+          <td>ring</td>
+          <td>Bob re-blinds Carol&#39;s set with its key</td>
+          <td>
+<span class="badge opaque">2 blinded point(s)</span>          </td>
+        </tr>
+        <tr class="">
+          <td>11</td>
+          <td>Carol</td>
+          <td>Combiner</td>
+          <td>Carol submits its fully-blinded set to the Combiner</td>
+          <td>
+<span class="badge opaque">2 blinded point(s)</span>          </td>
+        </tr>
+        <tr class="">
+          <td>12</td>
+          <td>Combiner</td>
+          <td>Output</td>
+          <td>Combiner finds 1 blinded point(s) common to all parties</td>
+          <td>
+<span class="badge opaque">1 blinded point(s)</span>          </td>
+        </tr>
+        <tr class="">
+          <td>13</td>
+          <td>ring</td>
+          <td>Output</td>
+          <td>Parties hand the Output a blinded table of the 8 public slots</td>
+          <td>
+<span class="badge opaque">8 blinded point(s)</span>          </td>
+        </tr>
+        <tr class="cleartext">
+          <td>14</td>
+          <td>Output</td>
+          <td>everyone</td>
+          <td>Output reveals the 1 common slot(s) to everyone</td>
+          <td>
+<span class="badge reveal">1 slot(s) &middot; cleartext</span>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="notes">
+    <h2>Privacy model</h2>
+    <ul>
+      <li>Each party reads only its own calendar; no entity ever holds all calendars in the clear.</li>
+      <li>The <strong>Combiner</strong> sees only opaque points: it computes the intersection but cannot map points back to slots.</li>
+      <li>The <strong>Output</strong> holds the de-blinding table but receives only the intersection, so it learns only the result.</li>
+      <li>Threat model: semi-honest, no collusion (the guarantee holds as long as Combiner and Output do not collude).</li>
+      <li>Documented leak: the Combiner learns each party's free-slot count &mdash;
+Alice: 2, Bob: 2, Carol: 2.</li>
+<li>Because the rounds re-run the PSI on progressively relaxed availability, the Combiner also watches each party's free-slot count <em>grow</em> across rounds &mdash; roughly how many easy/medium-movable meetings it has. Fresh blinding keys each round hide <em>which</em> slots changed; padding every set to the universe size would hide the counts too (left out for clarity, as in Part A).</li>    </ul>
+  </section>
+</main>
+</body>
+</html>
