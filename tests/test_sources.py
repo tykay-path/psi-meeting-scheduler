@@ -3,8 +3,9 @@ from datetime import UTC, datetime
 
 import pytest
 
+from gated_scheduler.freebusy import EASY, MEDIUM
 from gated_scheduler.grid import TimeGrid
-from gated_scheduler.sources.base import CalendarSource
+from gated_scheduler.sources.base import CalendarSource, DisplacedMeeting
 from gated_scheduler.sources.fixtures import FixtureCalendarSource
 from gated_scheduler.sources.google import GoogleCalendarSource
 
@@ -132,3 +133,107 @@ def test_google_source_is_a_documented_stub() -> None:
         src.party_ids()
     with pytest.raises(NotImplementedError):
         src.free_slots("Alice", day_grid())
+    with pytest.raises(NotImplementedError):
+        src.displaced_meetings("Alice", day_grid(), set(), relax_threshold=EASY)
+
+
+# --- Part B: tier parsing, relaxation, and displaced meetings ------------------------------
+
+
+def _easy_meeting_source() -> FixtureCalendarSource:
+    return FixtureCalendarSource(
+        {
+            "Alice": {
+                "events": [
+                    {
+                        "start": "2026-06-15T09:00:00+00:00",
+                        "end": "2026-06-15T10:00:00+00:00",
+                        "reschedule": "easy",
+                        "title": "1:1 with Dana",
+                    }
+                ]
+            }
+        }
+    )
+
+
+def test_free_slots_honors_relax_threshold() -> None:
+    grid = day_grid()
+    src = _easy_meeting_source()
+    assert src.free_slots("Alice", grid) == ids(grid, [1, 2])  # round 1: easy meeting still blocks
+    assert src.free_slots("Alice", grid, relax_threshold=EASY) == set(grid.slot_ids())  # freed
+
+
+def test_untagged_event_defaults_to_hard_in_fixtures() -> None:
+    grid = day_grid()
+    src = FixtureCalendarSource(
+        {
+            "Alice": {
+                "events": [
+                    {"start": "2026-06-15T09:00:00+00:00", "end": "2026-06-15T10:00:00+00:00"}
+                ]
+            }
+        }
+    )
+    assert src.free_slots("Alice", grid, relax_threshold=MEDIUM) == ids(grid, [1, 2])
+
+
+def test_displaced_meetings_reports_moved_meeting_with_title_and_tier() -> None:
+    grid = day_grid()
+    src = _easy_meeting_source()
+    chosen = ids(grid, [0])  # the 09:00 slot
+    displaced = src.displaced_meetings("Alice", grid, chosen, relax_threshold=EASY)
+    assert len(displaced) == 1
+    moved = displaced[0]
+    assert isinstance(moved, DisplacedMeeting)
+    assert moved.title == "1:1 with Dana"
+    assert moved.tier == EASY
+    assert moved.start == datetime(2026, 6, 15, 9, 0, tzinfo=UTC)
+    # nothing is displaced when we relax nothing
+    assert src.displaced_meetings("Alice", grid, chosen, relax_threshold=0) == []
+
+
+def test_unknown_reschedule_tier_raises() -> None:
+    grid = day_grid()
+    src = FixtureCalendarSource(
+        {
+            "Alice": {
+                "events": [
+                    {
+                        "start": "2026-06-15T09:00:00+00:00",
+                        "end": "2026-06-15T10:00:00+00:00",
+                        "reschedule": "sometimes",
+                    }
+                ]
+            }
+        }
+    )
+    with pytest.raises(ValueError):
+        src.free_slots("Alice", grid)
+
+
+def test_has_reschedulable_meetings_reflects_tags() -> None:
+    untagged = FixtureCalendarSource(
+        {
+            "Alice": {
+                "events": [
+                    {"start": "2026-06-15T09:00:00+00:00", "end": "2026-06-15T10:00:00+00:00"}
+                ]
+            }
+        }
+    )
+    tagged = FixtureCalendarSource(
+        {
+            "Alice": {
+                "events": [
+                    {
+                        "start": "2026-06-15T09:00:00+00:00",
+                        "end": "2026-06-15T10:00:00+00:00",
+                        "reschedule": "easy",
+                    }
+                ]
+            }
+        }
+    )
+    assert untagged.has_reschedulable_meetings() is False
+    assert tagged.has_reschedulable_meetings() is True

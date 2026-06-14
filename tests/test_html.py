@@ -1,9 +1,29 @@
 from datetime import UTC, datetime
 
 from gated_scheduler.grid import TimeGrid
-from gated_scheduler.scheduler import schedule_meeting
+from gated_scheduler.scheduler import schedule_meeting, schedule_tiered
 from gated_scheduler.sources.fixtures import FixtureCalendarSource
 from gated_scheduler.viz.html import render_html
+
+
+def _ev(s: int, e: int, **extra: object) -> dict[str, object]:
+    return {
+        "start": f"2026-06-15T{s:02d}:00:00+00:00",
+        "end": f"2026-06-15T{e:02d}:00:00+00:00",
+        **extra,
+    }
+
+
+def tiered_easy() -> object:
+    grid = grid_3_slots()
+    source = FixtureCalendarSource(
+        {
+            "Alice": {"events": [_ev(10, 11, reschedule="easy", title="1:1 with Ben")]},
+            "Bob": {"events": [_ev(9, 10), _ev(11, 12)]},
+            "Carol": {"events": [_ev(9, 10), _ev(11, 12)]},
+        }
+    )
+    return schedule_tiered(source, grid, slots_needed=1)
 
 
 def grid_3_slots() -> TimeGrid:
@@ -98,3 +118,49 @@ def test_html_escapes_party_names() -> None:
     html = render_html(schedule_meeting(source, grid, slots_needed=1))
     assert "<script>evil</script>" not in html
     assert "&lt;script&gt;" in html
+
+
+def test_tiered_html_is_full_document_with_rounds_and_winner() -> None:
+    html = render_html(tiered_easy())
+    assert html.lstrip().startswith("<!DOCTYPE html>")
+    assert "</html>" in html
+    assert "Round 1" in html and "Round 2" in html
+    assert "10:00" in html  # the chosen slot
+    assert "easy" in html.lower()  # the flexibility level reached
+
+
+def test_tiered_html_lists_displaced_meetings() -> None:
+    html = render_html(tiered_easy())
+    assert "1:1 with Ben" in html
+    assert "Alice" in html
+    assert "illustration" in html.lower()
+
+
+def test_tiered_html_includes_trace_and_is_self_contained() -> None:
+    html = render_html(tiered_easy())
+    assert "Combiner" in html and "Output" in html
+    assert "http://" not in html and "https://" not in html
+
+
+def test_tiered_html_reports_impossible() -> None:
+    grid = grid_3_slots()
+    source = FixtureCalendarSource(
+        {
+            "Alice": {"events": [_ev(9, 12)]},  # booked solid, immovable
+            "Bob": {"events": [_ev(9, 12, reschedule="easy", title="Focus")]},
+        }
+    )
+    html = render_html(schedule_tiered(source, grid, slots_needed=1))
+    assert "no meeting" in html.lower()
+
+
+def test_tiered_html_escapes_party_names() -> None:
+    grid = grid_3_slots()
+    source = FixtureCalendarSource(
+        {
+            "<script>evil</script>": {"events": [_ev(10, 11, reschedule="easy", title="x")]},
+            "Bob": {"events": []},
+        }
+    )
+    html = render_html(schedule_tiered(source, grid, slots_needed=1))
+    assert "<script>evil</script>" not in html

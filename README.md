@@ -23,8 +23,10 @@ just comparing availability under a privacy constraint. The right tool is a well
 cryptographic primitive: PSI lets several parties compute the intersection of their private sets
 while revealing nothing but the intersection itself.
 
-This project is **Part A** of that vision (availability matching). Preferences, natural-language
-requests, rescheduling, and learning behaviour over time are *Part B* — explicitly out of scope.
+**Part A** of that vision is privacy-preserving *availability matching* (the core below). **Part B**
+adds *preferences* — when no slot works for everyone, it finds the least-disruptive time by letting
+people reschedule the meetings they don't mind moving (see **Part B** below). Learning those
+preferences over time, natural-language requests, and a malicious-security model remain future work.
 
 ## Quickstart
 
@@ -33,7 +35,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"        # or: uv pip install -e ".[dev]"
 
-pytest                          # 93 tests
+pytest                          # 125 tests
 schedule run --help
 ```
 
@@ -81,6 +83,49 @@ The last one is three people in **three timezones** (Tel Aviv / New York / Londo
 calendar in its own local time — the grid normalises everything to a shared instant and still
 finds the one hour they share.
 
+## Part B — preferences via tiered relaxation
+
+The hard case is when **no time works for everyone**: every slot collides with someone's existing
+commitment. Part B finds the *least-disruptive* meeting anyway, mirroring how people really
+schedule — *"I'll move an internal 1:1 to make room for a customer call."*
+
+The trick is to **encode cost structurally, through the order in which meetings are freed** — no
+explicit cost numbers, and **no new cryptography**. Each meeting is tagged with how willing its
+owner is to move it (`easy` / `medium` / `hard`; untagged = `hard`). We then run the *same PSI* in
+**rounds**, relaxing more each time, and the **first round that finds a slot wins**:
+
+1. **Round 1** — true free/busy only.
+2. **Round 2** — also free the slots taken only by `easy` meetings.
+3. **Round 3** — also free `medium` ones.
+
+Availability only grows between rounds, so the first match disturbs only the cheapest tier that was
+necessary. Each round is an independent PSI run with **fresh blinding keys**, and — faithful to gated
+access — each party computes **locally** which of *its own* meetings it would move; no one ever
+learns what anyone else gives up.
+
+```bash
+schedule run --fixtures fixtures/reschedule_easy.json \
+  --window 2026-06-15..2026-06-16 --hours 9-17 --slot-minutes 60 \
+  --tz Asia/Jerusalem --duration 60 --out demo_partb.html
+```
+
+```
+Escalating rounds (each reruns the PSI with more meetings freed):
+  Round 1  no rescheduling             -> no common slot
+  Round 2  easy reschedules            -> match
+
+Result  : Mon Jun 15, 14:00 -> 15:00  (1 contiguous slot(s)), required: easy reschedules
+Revealed: 1 common slot(s): Mon Jun 15, 14:00
+Reschedules (each computed locally; no party sees another's):
+  Alice    moves 1 meeting(s): "1:1 with Ben" (easy, Mon Jun 15, 14:00)
+```
+
+No common slot exists until Alice's *easy* 1:1 is freed in round 2 — so the tool proposes 14:00 and
+tells Alice (and only Alice) what she'd move. The HTML report shows one mini-timeline per round with
+the winning round highlighted, plus the per-party "what must move" list. Other fixtures exercise the
+rest: `reschedule_medium.json` (needs round 3), `multi_person_sacrifice.json` (two people each free
+an easy meeting), and `reschedule_impossible.json` (no slot even at round 3).
+
 ## How the PSI works
 
 The protocol is multi-party PSI from **commutative (ECDH) encryption**, semi-honest:
@@ -114,13 +159,13 @@ calendar layer's only job is "produce this party's free-slot set on the grid."
 | Module | Responsibility |
 |---|---|
 | `grid.py` | The public time grid (the element universe); UTC normalisation; working-hours mask; interval→slot coverage; temporal adjacency |
-| `freebusy.py` | Event semantics → free-slot set (timezones, all-day, tentative, transparency, partial overlap) |
+| `freebusy.py` | Event semantics → free-slot set (timezones, all-day, tentative, transparency, partial overlap); **reschedule tiers** + relaxation (Part B) |
 | `matching.py` | Deterministic core: earliest run of *N contiguous* free slots; pluggable selection |
 | `psi/primitives.py` | Thin wrapper over libsodium ed25519 (`hash_to_group`, `random_scalar`, `blind`) |
 | `psi/channel.py` | `Channel` + `Transcript`: the seam where messages cross, recorded for audit & viz |
 | `psi/protocol.py` | The multi-party commutative-ECDH PSI (Party / Combiner / Output roles) |
-| `sources/` | The calendar seam: `CalendarSource`, a fixtures implementation, a Google stub |
-| `scheduler.py` | Orchestrates source → PSI → matching |
+| `sources/` | The calendar seam: `CalendarSource` (free slots + per-party *displaced-meeting* reporting), a fixtures implementation, a Google stub |
+| `scheduler.py` | Orchestrates source → PSI → matching; **tiered relaxation rounds** (Part B) |
 | `viz/html.py` | Self-contained HTML report |
 | `cli.py` | `schedule run …` |
 
@@ -128,18 +173,23 @@ calendar layer's only job is "produce this party's free-slot set on the grid."
 
 - **Threat model:** semi-honest, no collusion. Parties follow the protocol; the guarantee holds as
   long as the Combiner and the Output role don't collude. Defending against parties that *lie about
-  their availability* or *deviate from the protocol* is a separate axis (malicious-model PSI) — Part B.
+  their availability* or *deviate from the protocol* is a separate axis (malicious-model PSI) — still future.
 - **Documented leak:** the Combiner learns each party's free-slot *count* (set sizes). A standard
   mitigation is to pad every set to the universe size; left out of v1 for clarity.
-- **"Free" hides cost.** A plain free/busy set treats every open slot as equally available; it
-  can't express "free, but I'd rather not move this." That's a *preference* — Part B.
+- **Part B widens that leak slightly.** Run in rounds, the Combiner watches each party's free-slot
+  count *grow* between rounds — roughly how many `easy`/`medium`-movable meetings it has. Fresh
+  blinding keys each round hide *which* slots changed; the same padding would hide the counts too
+  (left out, for parity with the set-size choice above).
+- **"Free" needn't hide cost any more.** A plain free/busy set treats every open slot as equally
+  available. Part B's tiers express "free, but I'd rather not move this" *structurally* — by the
+  round in which a meeting is freed — so cost-awareness needs no explicit cost numbers and no new crypto.
 - **Duration/contiguity** is logic over the PSI output, not part of the PSI.
 - **Granularity is a dial.** Finer slots give more precision but enlarge the universe and make PSI
   heavier; 15-minute slots over a work-hour window stay small.
 
 ## Testing
 
-93 tests, test-driven throughout (`pytest`, with `hypothesis` for properties):
+125 tests, test-driven throughout (`pytest`, with `hypothesis` for properties):
 
 - **Core:** known-answer + edge cases (empty intersection, single slot, all-identical, one party
   free everywhere, the isolated-vs-consecutive **contiguity** case, day-boundary gaps) plus a
@@ -150,6 +200,9 @@ calendar layer's only job is "produce this party's free-slot set on the grid."
 - **Free/busy:** timezones, all-day, tentative vs. accepted, transparency, partial overlap.
 - **Pipeline / CLI / HTML:** end-to-end on fixtures, including the no-common-slot path and
   self-containedness / escaping of the report.
+- **Part B (tiered relaxation):** the seven documented cases — match in round 1/2/3, impossible,
+  multiple-matches-earliest-wins, multi-person sacrifice, monotonicity — a brute-force oracle for the
+  winning round, and a **per-round privacy assertion** (every round reveals only its intersection).
 
 ```bash
 pytest            # tests
@@ -157,11 +210,17 @@ ruff check .      # lint
 mypy gated_scheduler   # types
 ```
 
-## Out of scope (Part B) and future work
+## Out of scope and future work
 
-Preferences and cost-of-moving, input honesty / malicious & collusion resistance, rescheduling
-when no slot exists, natural-language requests — and **live Google Calendar**. The Google source is
-stubbed (`sources/google.py`) behind the same seam: its intended implementation uses Google's
-**free/busy API** (busy intervals only — a privacy win), wraps each interval as a `freebusy.Event`,
-and reuses everything downstream unchanged. By the time it matters, the only new thing under test is
-"does my fetch produce the same kind of set the fixtures did."
+Part B v1 deliberately stops short of a few things. **Re-placing the displaced meetings** (where
+does the moved 1:1 actually go? — the cascading-reschedule problem) is left to the humans. **How a
+meeting gets its tier** is a hand-tagged black box here; the natural next step is an agent that
+buckets a calendar into easy/medium/hard from its features and the owner's past behaviour. An
+**exact-optimum** variant (explicit secure cost-aggregation for the true minimum total disruption)
+is a possible v2 to test against this tiered baseline. **Input honesty / malicious & collusion
+resistance**, set-size **padding**, and **natural-language requests** also remain future work.
+
+**Live Google Calendar** stays a documented seam (`sources/google.py`): its intended implementation
+uses Google's **free/busy API** (busy intervals only — a privacy win), wraps each interval as a
+`freebusy.Event`, and reuses everything downstream unchanged. By the time it matters, the only new
+thing under test is "does my fetch produce the same kind of set the fixtures did."

@@ -1,0 +1,27 @@
+{
+  "Alice": {
+    "timezone": "Asia/Jerusalem",
+    "events": [
+      {"start": "2026-06-15T09:00:00", "end": "2026-06-15T12:00:00", "title": "Customer demos"},
+      {"start": "2026-06-15T13:00:00", "end": "2026-06-15T14:00:00", "title": "Pipeline review"},
+      {"start": "2026-06-15T14:00:00", "end": "2026-06-15T15:00:00", "reschedule": "easy", "title": "1:1 with Ben"},
+      {"start": "2026-06-15T15:00:00", "end": "2026-06-15T17:00:00", "title": "Release prep"}
+    ]
+  },
+  "Bob": {
+    "timezone": "Asia/Jerusalem",
+    "events": [
+      {"start": "2026-06-15T09:00:00", "end": "2026-06-15T11:00:00", "title": "Standup + email"},
+      {"start": "2026-06-15T12:00:00", "end": "2026-06-15T14:00:00", "title": "Design sync"},
+      {"start": "2026-06-15T15:00:00", "end": "2026-06-15T17:00:00", "title": "Interviews"}
+    ]
+  },
+  "Carol": {
+    "timezone": "Asia/Jerusalem",
+    "events": [
+      {"start": "2026-06-15T09:00:00", "end": "2026-06-15T10:00:00", "title": "Focus time"},
+      {"start": "2026-06-15T11:00:00", "end": "2026-06-15T14:00:00", "title": "Workshop"},
+      {"start": "2026-06-15T15:00:00", "end": "2026-06-15T17:00:00", "title": "Customer call"}
+    ]
+  }
+}
