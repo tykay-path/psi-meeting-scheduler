@@ -39,7 +39,7 @@ schedule run --help
 
 ## Demo
 
-A pre-generated report is included: **[demo.html](demo.html)** — download and open it in a browser to see the timeline and full PSI protocol trace.
+A pre-generated report is included: **[demo.html](https://tykay-path.github.io/psi-meeting-scheduler/demo.html)** — click to open it in your browser and see the timeline and full PSI protocol trace.
 
 Three colleagues, all in Tel Aviv, want a **45-minute** meeting during Monday business hours:
 
