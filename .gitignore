@@ -16,9 +16,6 @@ venv/
 .ruff_cache/
 .hypothesis/
 
-# Generated demo artifacts
-demo.html
-*.demo.html
 
 # OS / editor
 .DS_Store
