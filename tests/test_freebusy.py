@@ -1,7 +1,15 @@
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
-from gated_scheduler.freebusy import Event, EventStatus, free_slots
+from gated_scheduler.freebusy import (
+    EASY,
+    HARD,
+    MEDIUM,
+    Event,
+    EventStatus,
+    displaced_meetings,
+    free_slots,
+)
 from gated_scheduler.grid import TimeGrid
 
 
@@ -129,3 +137,126 @@ def test_all_day_event_with_degenerate_end_blocks_one_day() -> None:
         all_day=True,
     )
     assert free_slots([event], grid) == ids(grid, [3, 4, 5])
+
+
+# --- Part B: tiered relaxation -------------------------------------------------------------
+
+
+def test_untagged_event_defaults_to_hard_and_never_frees() -> None:
+    grid = day_grid()
+    event = Event(
+        start=datetime(2026, 6, 15, 9, 0, tzinfo=UTC),
+        end=datetime(2026, 6, 15, 10, 0, tzinfo=UTC),
+    )
+    assert event.tier == HARD
+    # even relaxing up to medium, an untagged (hard) meeting keeps its slot busy
+    assert free_slots([event], grid, relax_threshold=MEDIUM) == ids(grid, [1, 2])
+
+
+def test_easy_event_blocks_by_default_but_frees_when_relaxed() -> None:
+    grid = day_grid()
+    event = Event(
+        start=datetime(2026, 6, 15, 9, 0, tzinfo=UTC),
+        end=datetime(2026, 6, 15, 10, 0, tzinfo=UTC),
+        tier=EASY,
+        title="1:1 with Dana",
+    )
+    # round 1 (no relaxation): still busy
+    assert free_slots([event], grid) == ids(grid, [1, 2])
+    # round 2 (relax easy): the meeting is moved, slot frees
+    assert free_slots([event], grid, relax_threshold=EASY) == set(grid.slot_ids())
+
+
+def test_medium_event_frees_only_at_threshold_medium() -> None:
+    grid = day_grid()
+    event = Event(
+        start=datetime(2026, 6, 15, 9, 0, tzinfo=UTC),
+        end=datetime(2026, 6, 15, 10, 0, tzinfo=UTC),
+        tier=MEDIUM,
+    )
+    assert free_slots([event], grid, relax_threshold=0) == ids(grid, [1, 2])
+    assert free_slots([event], grid, relax_threshold=EASY) == ids(grid, [1, 2])
+    assert free_slots([event], grid, relax_threshold=MEDIUM) == set(grid.slot_ids())
+
+
+def test_slot_shared_by_easy_and_hard_stays_busy() -> None:
+    grid = day_grid()
+    # both events overlap the 09:00 slot (index 0)
+    easy = Event(
+        datetime(2026, 6, 15, 9, 0, tzinfo=UTC),
+        datetime(2026, 6, 15, 9, 30, tzinfo=UTC),
+        tier=EASY,
+    )
+    hard = Event(
+        datetime(2026, 6, 15, 9, 30, tzinfo=UTC),
+        datetime(2026, 6, 15, 10, 0, tzinfo=UTC),
+        tier=HARD,
+    )
+    # relaxing easy+medium still cannot free slot 0: the hard meeting never moves
+    assert free_slots([easy, hard], grid, relax_threshold=MEDIUM) == ids(grid, [1, 2])
+
+
+def test_relaxation_is_monotonic() -> None:
+    grid = day_grid()
+    events = [
+        Event(
+            datetime(2026, 6, 15, 9, 0, tzinfo=UTC),
+            datetime(2026, 6, 15, 10, 0, tzinfo=UTC),
+            tier=EASY,
+        ),
+        Event(
+            datetime(2026, 6, 15, 10, 0, tzinfo=UTC),
+            datetime(2026, 6, 15, 11, 0, tzinfo=UTC),
+            tier=MEDIUM,
+        ),
+        Event(
+            datetime(2026, 6, 15, 11, 0, tzinfo=UTC),
+            datetime(2026, 6, 15, 12, 0, tzinfo=UTC),
+            tier=HARD,
+        ),
+    ]
+    f0 = free_slots(events, grid, relax_threshold=0)
+    f1 = free_slots(events, grid, relax_threshold=EASY)
+    f2 = free_slots(events, grid, relax_threshold=MEDIUM)
+    assert f0 <= f1 <= f2  # availability only grows
+    assert f0 == set()
+    assert f1 == ids(grid, [0])
+    assert f2 == ids(grid, [0, 1])  # hard event keeps slot 2 busy forever
+
+
+def test_displaced_meetings_is_empty_when_nothing_is_relaxed() -> None:
+    grid = day_grid()
+    event = Event(
+        datetime(2026, 6, 15, 9, 0, tzinfo=UTC),
+        datetime(2026, 6, 15, 10, 0, tzinfo=UTC),
+        tier=EASY,
+        title="1:1",
+    )
+    assert displaced_meetings([event], grid, ids(grid, [0]), relax_threshold=0) == []
+
+
+def test_displaced_meetings_returns_relaxed_events_overlapping_the_meeting() -> None:
+    grid = day_grid()
+    overlapping = Event(
+        datetime(2026, 6, 15, 9, 0, tzinfo=UTC),
+        datetime(2026, 6, 15, 10, 0, tzinfo=UTC),
+        tier=EASY,
+        title="1:1 with Dana",
+    )
+    elsewhere = Event(
+        datetime(2026, 6, 15, 11, 0, tzinfo=UTC),
+        datetime(2026, 6, 15, 12, 0, tzinfo=UTC),
+        tier=EASY,
+        title="Gym",
+    )
+    hard_overlap = Event(
+        datetime(2026, 6, 15, 9, 0, tzinfo=UTC),
+        datetime(2026, 6, 15, 10, 0, tzinfo=UTC),
+        tier=HARD,
+        title="Board review",
+    )
+    displaced = displaced_meetings(
+        [overlapping, elsewhere, hard_overlap], grid, ids(grid, [0]), relax_threshold=EASY
+    )
+    # only the easy meeting that actually overlaps the chosen slot is displaced
+    assert displaced == [overlapping]

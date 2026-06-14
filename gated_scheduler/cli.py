@@ -14,10 +14,20 @@ from datetime import datetime, tzinfo
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from gated_scheduler.freebusy import EASY, HARD, MEDIUM
 from gated_scheduler.grid import TimeGrid
-from gated_scheduler.scheduler import ScheduleResult, schedule_meeting, slots_for_duration
+from gated_scheduler.psi.channel import Transcript
+from gated_scheduler.scheduler import (
+    ScheduleResult,
+    TieredScheduleResult,
+    schedule_meeting,
+    schedule_tiered,
+    slots_for_duration,
+)
 from gated_scheduler.sources.fixtures import FixtureCalendarSource
 from gated_scheduler.viz.html import render_html
+
+_TIER_LABELS = {EASY: "easy", MEDIUM: "medium", HARD: "hard"}
 
 
 def _fmt(dt: datetime, tz: tzinfo) -> str:
@@ -107,20 +117,48 @@ def _run(args: argparse.Namespace) -> int:
     try:
         slots_needed = slots_for_duration(duration, grid)
         rng = random.Random(args.seed) if args.seed is not None else None
-        result = schedule_meeting(source, grid, slots_needed=slots_needed, rng=rng)
+        report: ScheduleResult | TieredScheduleResult
+        if source.has_reschedulable_meetings():
+            report = schedule_tiered(source, grid, slots_needed=slots_needed, rng=rng)
+            _print_tiered_report(report, tz)
+        else:
+            report = schedule_meeting(source, grid, slots_needed=slots_needed, rng=rng)
+            _print_report(report, tz)
     except ValueError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
 
-    _print_report(result, tz)
-
     if args.out:
         out = Path(args.out)
-        out.write_text(render_html(result))
+        out.write_text(render_html(report))
         print(f"\nWrote {out}")
         if args.open_browser:
             webbrowser.open(out.resolve().as_uri())
     return 0
+
+
+def _print_trace(transcript: Transcript) -> None:
+    print("Protocol trace (only blinded points travel until the final result):")
+    for message in transcript.messages:
+        payload = (
+            f"{message.size} slot(s) - CLEARTEXT"
+            if message.reveals_cleartext
+            else f"{message.size} blinded point(s)"
+        )
+        arrow = f"{message.sender} -> {message.receiver}"
+        print(f"  #{message.step:02d}  {arrow:<26}  {message.summary}  [{payload}]")
+
+
+def _print_revealed(grid: TimeGrid, common_slot_ids: frozenset[str], tz: tzinfo) -> None:
+    common_slots = sorted(
+        (grid.slots[i] for sid in common_slot_ids if (i := grid.index_of(sid)) is not None),
+        key=lambda s: s.start,
+    )
+    if common_slots:
+        labels = ", ".join(_fmt(s.start, tz) for s in common_slots)
+        print(f"Revealed: {len(common_slots)} common slot(s): {labels}")
+    else:
+        print("Revealed: 0 common slots")
 
 
 def _print_report(result: ScheduleResult, tz: tzinfo) -> None:
@@ -131,15 +169,7 @@ def _print_report(result: ScheduleResult, tz: tzinfo) -> None:
     print(f"Parties : {names}")
     print(f"Grid    : {window} | {grid.slot_minutes}-min slots | {len(grid)} slots | {tz}")
     print()
-    print("Protocol trace (only blinded points travel until the final result):")
-    for message in result.psi.transcript.messages:
-        payload = (
-            f"{message.size} slot(s) - CLEARTEXT"
-            if message.reveals_cleartext
-            else f"{message.size} blinded point(s)"
-        )
-        arrow = f"{message.sender} -> {message.receiver}"
-        print(f"  #{message.step:02d}  {arrow:<26}  {message.summary}  [{payload}]")
+    _print_trace(result.psi.transcript)
     print()
 
     party_count = len(result.free_by_party)
@@ -152,20 +182,52 @@ def _print_report(result: ScheduleResult, tz: tzinfo) -> None:
         )
     else:
         print(f"Result  : No common slot found for all {party_count} parties.")
+    _print_revealed(grid, result.common_slot_ids, tz)
 
-    common_slots = sorted(
-        (
-            grid.slots[index]
-            for sid in result.common_slot_ids
-            if (index := grid.index_of(sid)) is not None
-        ),
-        key=lambda s: s.start,
-    )
-    if common_slots:
-        labels = ", ".join(_fmt(s.start, tz) for s in common_slots)
-        print(f"Revealed: {len(common_slots)} common slot(s): {labels}")
+
+def _print_tiered_report(result: TieredScheduleResult, tz: tzinfo) -> None:
+    grid = result.grid
+    names = ", ".join(sorted(result.free_by_party))
+    window = f"{_fmt(grid.start, tz)} -> {_fmt(grid.end, tz)}"
+    print("Gated-Access Meeting Scheduling - tiered relaxation (Part B)")
+    print(f"Parties : {names}")
+    print(f"Grid    : {window} | {grid.slot_minutes}-min slots | {len(grid)} slots | {tz}")
+    print()
+    print("Escalating rounds (each reruns the PSI with more meetings freed):")
+    for n, rnd in enumerate(result.rounds, start=1):
+        verdict = "match" if rnd.result.meeting is not None else "no common slot"
+        print(f"  Round {n}  {rnd.label:<26}  -> {verdict}")
+    print()
+    _print_trace(result.psi.transcript)
+    print()
+
+    if result.meeting is not None:
+        meeting = result.meeting
+        end_label = meeting.end.astimezone(tz).strftime("%H:%M")
+        print(
+            f"Result  : {_fmt(meeting.start, tz)} -> {end_label}  "
+            f"({len(meeting.slots)} contiguous slot(s)), required: {result.relaxation_used}"
+        )
+        _print_revealed(grid, result.common_slot_ids, tz)
+        _print_displaced(result, tz)
     else:
-        print("Revealed: 0 common slots")
+        print("Result  : No meeting possible, even after freeing medium-cost meetings.")
+        _print_revealed(grid, result.common_slot_ids, tz)
+
+
+def _print_displaced(result: TieredScheduleResult, tz: tzinfo) -> None:
+    if not result.displaced_by_party:
+        print("Reschedules: none -- everyone was already free at the chosen time.")
+        return
+    print("Reschedules (each computed locally; no party sees another's):")
+    for name in sorted(result.displaced_by_party):
+        moved = result.displaced_by_party[name]
+        items = "; ".join(
+            f'"{m.title or "(untitled)"}" ({_TIER_LABELS.get(m.tier, str(m.tier))}, '
+            f"{_fmt(m.start, tz)})"
+            for m in moved
+        )
+        print(f"  {name:<8} moves {len(moved)} meeting(s): {items}")
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -7,14 +7,18 @@ returns busy intervals directly instead of full event details -- a better fit *a
 win (no titles or attendees, just busy/free), aligned with the minimal-disclosure spirit of the
 whole design. Each busy interval becomes an ``Event`` and the existing ``freebusy`` logic is
 reused unchanged, so this layer stays thin.
+
+Note for Part B: free/busy returns no titles or reschedule hints, so a real implementation would
+source tiers/titles elsewhere (the owner's own agent), keeping the relaxation decision local.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Any
 
 from gated_scheduler.grid import TimeGrid
-from gated_scheduler.sources.base import CalendarSource
+from gated_scheduler.sources.base import CalendarSource, DisplacedMeeting
 
 _NOT_IMPLEMENTED = (
     "GoogleCalendarSource is a stub for v1 (which runs on fixtures). To implement: authenticate "
@@ -30,5 +34,15 @@ class GoogleCalendarSource(CalendarSource):
     def party_ids(self) -> list[str]:
         raise NotImplementedError(_NOT_IMPLEMENTED)
 
-    def free_slots(self, party_id: str, grid: TimeGrid) -> set[str]:
+    def free_slots(self, party_id: str, grid: TimeGrid, *, relax_threshold: int = 0) -> set[str]:
+        raise NotImplementedError(_NOT_IMPLEMENTED)
+
+    def displaced_meetings(
+        self,
+        party_id: str,
+        grid: TimeGrid,
+        meeting_slot_ids: Iterable[str],
+        *,
+        relax_threshold: int,
+    ) -> list[DisplacedMeeting]:
         raise NotImplementedError(_NOT_IMPLEMENTED)
