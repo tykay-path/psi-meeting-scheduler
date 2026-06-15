@@ -12,6 +12,7 @@ import sys
 import webbrowser
 from datetime import datetime, tzinfo
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from gated_scheduler.freebusy import EASY, HARD, MEDIUM
@@ -24,10 +25,94 @@ from gated_scheduler.scheduler import (
     schedule_tiered,
     slots_for_duration,
 )
+from gated_scheduler.sources.base import CalendarSource
 from gated_scheduler.sources.fixtures import FixtureCalendarSource
+from gated_scheduler.sources.google import CalendarClient, GoogleCalendarSource, build_google_client
 from gated_scheduler.viz.html import render_html
 
 _TIER_LABELS = {EASY: "easy", MEDIUM: "medium", HARD: "hard"}
+
+
+class _SourceError(Exception):
+    """A user-facing problem building the calendar source (bad flags, missing file)."""
+
+
+_CAL_SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
+
+
+def _load_google_client(
+    credentials: str, *, auth: str = "service-account", token_path: str | None = None
+) -> CalendarClient:
+    """Load Google credentials from a JSON path and build a live client.
+
+    Isolated behind one function so tests can monkeypatch it with a fake (no network, no creds),
+    and so the optional ``google`` dependency is imported only when actually scheduling live.
+    ``auth="oauth"`` runs an interactive installed-app consent flow (for a personal account with no
+    Workspace admin), caching the user token at ``token_path`` for reuse.
+    """
+    try:
+        if auth == "oauth":
+            creds = _oauth_user_credentials(credentials, token_path)
+        else:
+            from google.oauth2.service_account import (  # noqa: PLC0415  (lazy: optional dep)
+                Credentials,
+            )
+
+            creds = Credentials.from_service_account_file(credentials, scopes=_CAL_SCOPES)
+    except ImportError as error:  # pragma: no cover - only without the extra installed
+        raise _SourceError(
+            "Google support requires the 'google' extra: pip install 'gated-scheduler[google]'"
+        ) from error
+    return build_google_client(creds)
+
+
+def _oauth_user_credentials(client_secrets: str, token_path: str | None) -> Any:  # pragma: no cover
+    """Interactive OAuth: reuse a cached token if valid, else run the consent flow once.
+
+    Glue over ``google-auth-oauthlib``; not unit-tested (it opens a browser), matching how the
+    live API adapter in ``sources/google.py`` is treated.
+    """
+    import os  # noqa: PLC0415
+
+    from google.auth.transport.requests import Request  # noqa: PLC0415
+    from google.oauth2.credentials import Credentials as UserCredentials  # noqa: PLC0415
+    from google_auth_oauthlib.flow import InstalledAppFlow  # noqa: PLC0415
+
+    creds = None
+    if token_path and os.path.exists(token_path):
+        creds = UserCredentials.from_authorized_user_file(token_path, _CAL_SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(client_secrets, _CAL_SCOPES)
+            creds = flow.run_local_server(port=0)
+        if token_path:
+            with open(token_path, "w") as handle:
+                handle.write(creds.to_json())
+    return creds
+
+
+def _build_source(args: argparse.Namespace) -> CalendarSource:
+    if args.source == "google":
+        if not args.calendars:
+            raise _SourceError("--source google requires --calendars (comma-separated ids)")
+        if not args.credentials:
+            raise _SourceError("--source google requires --credentials (path to JSON)")
+        calendar_ids = [c.strip() for c in args.calendars.split(",") if c.strip()]
+        client = _load_google_client(
+            args.credentials, auth=args.auth, token_path=args.token
+        )
+        return GoogleCalendarSource(
+            client, calendar_ids, tentative_is_busy=not args.tentative_free
+        )
+
+    if not args.fixtures:
+        raise _SourceError("--source fixtures requires --fixtures (path to JSON)")
+    fixtures = Path(args.fixtures)
+    if not fixtures.exists():
+        raise _SourceError(f"fixtures file not found: {fixtures}")
+    return FixtureCalendarSource.from_file(fixtures, tentative_is_busy=not args.tentative_free)
 
 
 def _fmt(dt: datetime, tz: tzinfo) -> str:
@@ -60,8 +145,32 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Find a meeting time everyone is free for, via multi-party PSI.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
-    run = sub.add_parser("run", help="Schedule over a JSON fixtures file.")
-    run.add_argument("--fixtures", required=True, help="path to the calendars JSON file")
+    run = sub.add_parser("run", help="Schedule over fixture or live Google calendars.")
+    run.add_argument(
+        "--source",
+        choices=["fixtures", "google"],
+        default="fixtures",
+        help="calendar source (default: fixtures)",
+    )
+    run.add_argument("--fixtures", help="path to the calendars JSON file (--source fixtures)")
+    run.add_argument(
+        "--calendars", help="comma-separated calendar ids/emails (--source google)"
+    )
+    run.add_argument(
+        "--credentials",
+        help="path to Google credentials JSON: a service-account key, or an OAuth "
+        "client-secrets file when --auth oauth (--source google)",
+    )
+    run.add_argument(
+        "--auth",
+        choices=["service-account", "oauth"],
+        default="service-account",
+        help="Google auth flow (--source google; default: service-account)",
+    )
+    run.add_argument(
+        "--token",
+        help="path to cache/read the OAuth user token (--auth oauth)",
+    )
     run.add_argument("--window", required=True, help="START..END, ISO date or datetime")
     run.add_argument("--slot-minutes", type=int, default=15, help="grid granularity (default 15)")
     run.add_argument("--hours", default=None, help="working hours, e.g. 9-18 (optional)")
@@ -107,18 +216,25 @@ def _run(args: argparse.Namespace) -> int:
         print(f"error: {error}", file=sys.stderr)
         return 2
 
-    fixtures = Path(args.fixtures)
-    if not fixtures.exists():
-        print(f"error: fixtures file not found: {fixtures}", file=sys.stderr)
+    try:
+        source = _build_source(args)
+    except _SourceError as error:
+        print(f"error: {error}", file=sys.stderr)
         return 2
-    source = FixtureCalendarSource.from_file(fixtures, tentative_is_busy=not args.tentative_free)
 
     duration = args.duration if args.duration is not None else args.slot_minutes
     try:
         slots_needed = slots_for_duration(duration, grid)
         rng = random.Random(args.seed) if args.seed is not None else None
         report: ScheduleResult | TieredScheduleResult
-        if source.has_reschedulable_meetings():
+        # Fixtures know whether any meeting is reschedulable (selects the single-round fast path);
+        # Google calendars don't expose that cheaply, so they always take the tiered path (which
+        # subsumes round 1 -- it just stops there when round 1 already matches).
+        tiered = (
+            not isinstance(source, FixtureCalendarSource)
+            or source.has_reschedulable_meetings()
+        )
+        if tiered:
             report = schedule_tiered(source, grid, slots_needed=slots_needed, rng=rng)
             _print_tiered_report(report, tz)
         else:

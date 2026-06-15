@@ -21,3 +21,10 @@ venv/
 .DS_Store
 .idea/
 .vscode/
+
+# Google credentials / OAuth secrets -- never commit these
+client_secret*.json
+*credentials*.json
+*service*account*.json
+token.json
+sa.json

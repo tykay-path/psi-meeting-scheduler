@@ -1,6 +1,8 @@
 import json
+from datetime import datetime
 from pathlib import Path
 
+import gated_scheduler.cli as cli
 from gated_scheduler.cli import main
 
 
@@ -181,6 +183,104 @@ def test_run_tiered_escalates_and_reports_who_moves(tmp_path, capsys) -> None:
     assert "blinded" in printed and "CLEARTEXT" in printed  # trace still proves privacy
     assert out.exists()
     assert out.read_text().lstrip().startswith("<!DOCTYPE html>")
+
+
+class _FakeGoogleClient:
+    """A no-network stand-in for the Google API client, keyed by calendar id."""
+
+    def __init__(self, freebusy_by_cal: dict[str, list[dict]]) -> None:
+        self._freebusy = freebusy_by_cal
+
+    def freebusy(self, calendar_id: str, time_min: datetime, time_max: datetime) -> list[dict]:
+        return self._freebusy.get(calendar_id, [])
+
+    def list_events(self, calendar_id: str, time_min: datetime, time_max: datetime) -> list[dict]:
+        return []
+
+
+def test_run_with_google_source(tmp_path, capsys, monkeypatch) -> None:
+    def gbusy(s: int, e: int) -> dict[str, str]:
+        return {"start": f"2026-06-15T{s:02d}:00:00Z", "end": f"2026-06-15T{e:02d}:00:00Z"}
+
+    fake = _FakeGoogleClient(
+        {
+            "alice@x.com": [gbusy(11, 12)],  # free 09, 10
+            "bob@x.com": [gbusy(9, 10)],  # free 10, 11
+            "carol@x.com": [gbusy(9, 10), gbusy(11, 12)],  # free 10
+        }
+    )
+    monkeypatch.setattr(cli, "_load_google_client", lambda credentials, **kw: fake)
+    code = main(
+        [
+            "run",
+            "--source",
+            "google",
+            "--calendars",
+            "alice@x.com,bob@x.com,carol@x.com",
+            "--credentials",
+            str(tmp_path / "creds.json"),
+            "--window",
+            "2026-06-15..2026-06-16",
+            "--hours",
+            "9-12",
+            "--slot-minutes",
+            "60",
+        ]
+    )
+    assert code == 0
+    printed = capsys.readouterr().out
+    assert "10:00" in printed  # the one common slot
+    assert "blinded" in printed and "CLEARTEXT" in printed  # privacy trace intact
+
+
+def test_google_oauth_flag_forwarded_to_loader(tmp_path, capsys, monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_loader(credentials, *, auth, token_path):
+        captured["credentials"] = credentials
+        captured["auth"] = auth
+        captured["token_path"] = token_path
+        return _FakeGoogleClient({"alice@x.com": [], "bob@x.com": []})
+
+    monkeypatch.setattr(cli, "_load_google_client", fake_loader)
+    code = main(
+        [
+            "run",
+            "--source",
+            "google",
+            "--calendars",
+            "alice@x.com,bob@x.com",
+            "--credentials",
+            str(tmp_path / "client_secret.json"),
+            "--auth",
+            "oauth",
+            "--token",
+            str(tmp_path / "token.json"),
+            "--window",
+            "2026-06-15..2026-06-16",
+            "--hours",
+            "9-12",
+            "--slot-minutes",
+            "60",
+        ]
+    )
+    assert code == 0
+    assert captured["auth"] == "oauth"
+    assert captured["token_path"] == str(tmp_path / "token.json")
+
+
+def test_google_source_requires_calendars(tmp_path, capsys) -> None:
+    code = main(
+        [
+            "run",
+            "--source",
+            "google",
+            "--window",
+            "2026-06-15..2026-06-16",
+        ]
+    )
+    assert code != 0
+    assert "calendars" in capsys.readouterr().err.lower()
 
 
 def test_run_tiered_reports_impossible(tmp_path, capsys) -> None:
