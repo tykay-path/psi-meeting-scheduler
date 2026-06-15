@@ -164,7 +164,7 @@ calendar layer's only job is "produce this party's free-slot set on the grid."
 | `psi/primitives.py` | Thin wrapper over libsodium ed25519 (`hash_to_group`, `random_scalar`, `blind`) |
 | `psi/channel.py` | `Channel` + `Transcript`: the seam where messages cross, recorded for audit & viz |
 | `psi/protocol.py` | The multi-party commutative-ECDH PSI (Party / Combiner / Output roles) |
-| `sources/` | The calendar seam: `CalendarSource` (free slots + per-party *displaced-meeting* reporting), a fixtures implementation, a Google stub |
+| `sources/` | The calendar seam: `CalendarSource` (free slots + per-party *displaced-meeting* reporting), a fixtures implementation, and a hybrid Google Calendar implementation (free/busy + own-calendar event detail) |
 | `scheduler.py` | Orchestrates source → PSI → matching; **tiered relaxation rounds** (Part B) |
 | `viz/html.py` | Self-contained HTML report |
 | `cli.py` | `schedule run …` |
@@ -189,7 +189,7 @@ calendar layer's only job is "produce this party's free-slot set on the grid."
 
 ## Testing
 
-125 tests, test-driven throughout (`pytest`, with `hypothesis` for properties):
+142 tests, test-driven throughout (`pytest`, with `hypothesis` for properties):
 
 - **Core:** known-answer + edge cases (empty intersection, single slot, all-identical, one party
   free everywhere, the isolated-vs-consecutive **contiguity** case, day-boundary gaps) plus a
@@ -198,6 +198,9 @@ calendar layer's only job is "produce this party's free-slot set on the grid."
   inputs, order-independence, and a **privacy assertion** — no message except the final result ever
   carries cleartext, and the Output role only ever receives the intersection.
 - **Free/busy:** timezones, all-day, tentative vs. accepted, transparency, partial overlap.
+- **Google source:** the free/busy → `Event` and event-resource → `Event` mappings (tier from
+  extended properties, all-day, status, transparency, RFC3339), the free/busy↔events agreement at
+  threshold 0, monotonic relaxation, and displaced-meeting reporting — all via an injected fake client.
 - **Pipeline / CLI / HTML:** end-to-end on fixtures, including the no-common-slot path and
   self-containedness / escaping of the report.
 - **Part B (tiered relaxation):** the seven documented cases — match in round 1/2/3, impossible,
@@ -220,7 +223,29 @@ buckets a calendar into easy/medium/hard from its features and the owner's past 
 is a possible v2 to test against this tiered baseline. **Input honesty / malicious & collusion
 resistance**, set-size **padding**, and **natural-language requests** also remain future work.
 
-**Live Google Calendar** stays a documented seam (`sources/google.py`): its intended implementation
-uses Google's **free/busy API** (busy intervals only — a privacy win), wraps each interval as a
-`freebusy.Event`, and reuses everything downstream unchanged. By the time it matters, the only new
-thing under test is "does my fetch produce the same kind of set the fixtures did."
+**Live Google Calendar** is implemented in `sources/google.py` as a **hybrid** of two reads, both
+local to a single party's calendar:
+
+- **Availability (Part A)** uses Google's **free/busy API** — busy intervals only, no titles or
+  attendees (a privacy win). Each interval becomes a `freebusy.Event` and everything downstream is
+  reused unchanged.
+- **Relaxation + "what must move" (Part B)** needs detail free/busy can't express, so when a round
+  relaxes (`relax_threshold > 0`) the source reads that party's **own events** and maps each to a
+  `freebusy.Event`. The reschedule tier comes from the event's private
+  `extendedProperties.private.reschedule` (`easy`/`medium`/`hard`); untagged defaults to `hard`,
+  exactly like the fixtures.
+
+The Google API client is **injected** (`CalendarClient` protocol), so the mapping logic is fully
+unit-tested with hand-built fixtures and no network. The live adapter and `google.oauth2`
+credential loading are lazy-imported behind the optional `google` extra:
+
+```bash
+pip install 'gated-scheduler[google]'
+schedule run --source google \
+  --calendars alice@example.com,bob@example.com \
+  --credentials service-account.json \
+  --window 2026-06-15..2026-06-16 --hours 9-18
+```
+
+Because only blinded slot ids ever cross the PSI, swapping fixtures for Google changes nothing about
+the privacy guarantee — titles and tiers are read and used **locally**, never aggregated.

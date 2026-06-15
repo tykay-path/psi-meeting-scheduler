@@ -3,11 +3,12 @@ from datetime import UTC, datetime
 
 import pytest
 
-from gated_scheduler.freebusy import EASY, MEDIUM
+from gated_scheduler.freebusy import EASY, HARD, MEDIUM, EventStatus
+from gated_scheduler.freebusy import free_slots as derive_free_slots
 from gated_scheduler.grid import TimeGrid
 from gated_scheduler.sources.base import CalendarSource, DisplacedMeeting
 from gated_scheduler.sources.fixtures import FixtureCalendarSource
-from gated_scheduler.sources.google import GoogleCalendarSource
+from gated_scheduler.sources.google import GoogleCalendarSource, _event_from_google
 
 
 def day_grid() -> TimeGrid:
@@ -126,15 +127,223 @@ def test_unknown_party_raises() -> None:
         src.free_slots("Nobody", day_grid())
 
 
-def test_google_source_is_a_documented_stub() -> None:
-    src = GoogleCalendarSource()
-    assert isinstance(src, CalendarSource)
-    with pytest.raises(NotImplementedError):
-        src.party_ids()
-    with pytest.raises(NotImplementedError):
-        src.free_slots("Alice", day_grid())
-    with pytest.raises(NotImplementedError):
-        src.displaced_meetings("Alice", day_grid(), set(), relax_threshold=EASY)
+# --- Google Calendar source -----------------------------------------------------------------
+
+
+class FakeCalendarClient:
+    """A stand-in for the Google API client: returns hand-built Google-shaped dicts.
+
+    Mirrors the ``CalendarClient`` protocol (``freebusy`` / ``list_events``) without any network,
+    so the source's mapping logic is exercised directly.
+    """
+
+    def __init__(
+        self,
+        *,
+        freebusy_by_cal: dict[str, list[dict]] | None = None,
+        events_by_cal: dict[str, list[dict]] | None = None,
+    ) -> None:
+        self._freebusy = freebusy_by_cal or {}
+        self._events = events_by_cal or {}
+        self.freebusy_calls: list[str] = []
+        self.events_calls: list[str] = []
+
+    def freebusy(self, calendar_id: str, time_min: datetime, time_max: datetime) -> list[dict]:
+        self.freebusy_calls.append(calendar_id)
+        return self._freebusy.get(calendar_id, [])
+
+    def list_events(self, calendar_id: str, time_min: datetime, time_max: datetime) -> list[dict]:
+        self.events_calls.append(calendar_id)
+        return self._events.get(calendar_id, [])
+
+
+def _timed_event(start: str, end: str, **extra: object) -> dict:
+    return {"start": {"dateTime": start}, "end": {"dateTime": end}, **extra}
+
+
+def _easy_events_client() -> FakeCalendarClient:
+    """One easy-tier 09:00-10:00 meeting, exposed both as free/busy and as event detail."""
+    busy = [{"start": "2026-06-15T09:00:00Z", "end": "2026-06-15T10:00:00Z"}]
+    event = _timed_event(
+        "2026-06-15T09:00:00+00:00",
+        "2026-06-15T10:00:00+00:00",
+        summary="1:1 with Dana",
+        extendedProperties={"private": {"reschedule": "easy"}},
+    )
+    return FakeCalendarClient(
+        freebusy_by_cal={"alice@x.com": busy}, events_by_cal={"alice@x.com": [event]}
+    )
+
+
+def test_google_source_is_a_calendar_source() -> None:
+    assert isinstance(GoogleCalendarSource(FakeCalendarClient(), []), CalendarSource)
+
+
+def test_google_party_ids_are_sorted_calendar_ids() -> None:
+    src = GoogleCalendarSource(FakeCalendarClient(), ["bob@x.com", "alice@x.com"])
+    assert src.party_ids() == ["alice@x.com", "bob@x.com"]
+
+
+def test_google_free_slots_uses_freebusy_for_round_one() -> None:
+    grid = day_grid()
+    client = FakeCalendarClient(
+        freebusy_by_cal={
+            "alice@x.com": [{"start": "2026-06-15T09:00:00Z", "end": "2026-06-15T10:00:00Z"}]
+        }
+    )
+    src = GoogleCalendarSource(client, ["alice@x.com"])
+    assert src.free_slots("alice@x.com", grid) == ids(grid, [1, 2])
+    assert client.freebusy_calls == ["alice@x.com"]
+    assert client.events_calls == []  # round 1 never reads event detail
+
+
+def test_google_free_slots_uses_events_when_relaxing() -> None:
+    grid = day_grid()
+    client = _easy_events_client()
+    src = GoogleCalendarSource(client, ["alice@x.com"])
+    # relaxing easy meetings frees the 09:00 slot via the events path
+    assert src.free_slots("alice@x.com", grid, relax_threshold=EASY) == set(grid.slot_ids())
+    assert client.events_calls == ["alice@x.com"]  # relaxation reads own-calendar detail
+
+
+def test_google_free_slots_monotonic_across_thresholds() -> None:
+    grid = day_grid()
+    src = GoogleCalendarSource(_easy_events_client(), ["alice@x.com"])
+    round0 = src.free_slots("alice@x.com", grid, relax_threshold=0)
+    round_easy = src.free_slots("alice@x.com", grid, relax_threshold=EASY)
+    assert round0 == ids(grid, [1, 2])  # easy meeting still blocks at threshold 0
+    assert round0 <= round_easy  # availability only grows
+
+
+def test_google_freebusy_and_events_agree_at_threshold_zero() -> None:
+    """The hybrid seam: the same meeting must yield the same free set either way at threshold 0.
+
+    The free/busy path (round 1) and the events path (relaxation rounds) describe the same
+    calendar; if they disagreed at threshold 0, monotonicity across rounds would break.
+    """
+    grid = day_grid()
+    client = _easy_events_client()
+    # free/busy path (what round 1 uses)
+    via_freebusy = GoogleCalendarSource(client, ["alice@x.com"]).free_slots(
+        "alice@x.com", grid, relax_threshold=0
+    )
+    # events path at threshold 0: derive directly from the mapped events
+    raw_events = client.list_events("alice@x.com", grid.start, grid.end)
+    events = [_event_from_google(raw) for raw in raw_events]
+    via_events = derive_free_slots(events, grid, relax_threshold=0)
+    assert via_freebusy == via_events
+
+
+def test_google_displaced_meetings_reports_title_and_tier() -> None:
+    grid = day_grid()
+    src = GoogleCalendarSource(_easy_events_client(), ["alice@x.com"])
+    chosen = ids(grid, [0])  # the 09:00 slot
+    displaced = src.displaced_meetings("alice@x.com", grid, chosen, relax_threshold=EASY)
+    assert len(displaced) == 1
+    moved = displaced[0]
+    assert isinstance(moved, DisplacedMeeting)
+    assert moved.title == "1:1 with Dana"
+    assert moved.tier == EASY
+    assert moved.start == datetime(2026, 6, 15, 9, 0, tzinfo=UTC)
+    # relaxing nothing displaces nothing
+    assert src.displaced_meetings("alice@x.com", grid, chosen, relax_threshold=0) == []
+
+
+def test_google_unknown_reschedule_tier_raises() -> None:
+    grid = day_grid()
+    client = FakeCalendarClient(
+        events_by_cal={
+            "alice@x.com": [
+                _timed_event(
+                    "2026-06-15T09:00:00+00:00",
+                    "2026-06-15T10:00:00+00:00",
+                    extendedProperties={"private": {"reschedule": "sometimes"}},
+                )
+            ]
+        }
+    )
+    src = GoogleCalendarSource(client, ["alice@x.com"])
+    with pytest.raises(ValueError):
+        src.free_slots("alice@x.com", grid, relax_threshold=EASY)
+
+
+# --- Google event mapping (_event_from_google) ----------------------------------------------
+# The source's only real job is mapping a Google event resource to a freebusy.Event; the event
+# *semantics* (blocking, relaxation) are already proven by freebusy's own tests.
+
+
+def test_map_timed_event_with_tier_and_title() -> None:
+    event = _event_from_google(
+        _timed_event(
+            "2026-06-15T09:00:00+00:00",
+            "2026-06-15T10:00:00+00:00",
+            summary="1:1 with Dana",
+            extendedProperties={"private": {"reschedule": "medium"}},
+        )
+    )
+    assert event.start == datetime(2026, 6, 15, 9, 0, tzinfo=UTC)
+    assert event.end == datetime(2026, 6, 15, 10, 0, tzinfo=UTC)
+    assert event.tier == MEDIUM
+    assert event.title == "1:1 with Dana"
+
+
+def test_map_untagged_event_defaults_to_hard() -> None:
+    event = _event_from_google(
+        _timed_event("2026-06-15T09:00:00+00:00", "2026-06-15T10:00:00+00:00")
+    )
+    assert event.tier == HARD
+    assert event.title == ""
+
+
+def test_map_cancelled_status() -> None:
+    event = _event_from_google(
+        _timed_event("2026-06-15T09:00:00+00:00", "2026-06-15T10:00:00+00:00", status="cancelled")
+    )
+    assert event.status == EventStatus.CANCELLED
+
+
+def test_map_tentative_status() -> None:
+    event = _event_from_google(
+        _timed_event("2026-06-15T09:00:00+00:00", "2026-06-15T10:00:00+00:00", status="tentative")
+    )
+    assert event.status == EventStatus.TENTATIVE
+
+
+def test_map_transparent_event() -> None:
+    event = _event_from_google(
+        _timed_event(
+            "2026-06-15T09:00:00+00:00", "2026-06-15T10:00:00+00:00", transparency="transparent"
+        )
+    )
+    assert event.transparent is True
+
+
+def test_map_opaque_event_is_not_transparent() -> None:
+    event = _event_from_google(
+        _timed_event(
+            "2026-06-15T09:00:00+00:00", "2026-06-15T10:00:00+00:00", transparency="opaque"
+        )
+    )
+    assert event.transparent is False
+
+
+def test_map_all_day_event() -> None:
+    event = _event_from_google({"start": {"date": "2026-06-15"}, "end": {"date": "2026-06-16"}})
+    assert event.all_day is True
+    assert event.start == datetime(2026, 6, 15, 0, 0, tzinfo=UTC)
+    assert event.end == datetime(2026, 6, 16, 0, 0, tzinfo=UTC)
+
+
+def test_map_unknown_tier_raises() -> None:
+    with pytest.raises(ValueError):
+        _event_from_google(
+            _timed_event(
+                "2026-06-15T09:00:00+00:00",
+                "2026-06-15T10:00:00+00:00",
+                extendedProperties={"private": {"reschedule": "sometimes"}},
+            )
+        )
+
 
 
 # --- Part B: tier parsing, relaxation, and displaced meetings ------------------------------

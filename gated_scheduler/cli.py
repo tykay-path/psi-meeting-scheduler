@@ -24,10 +24,56 @@ from gated_scheduler.scheduler import (
     schedule_tiered,
     slots_for_duration,
 )
+from gated_scheduler.sources.base import CalendarSource
 from gated_scheduler.sources.fixtures import FixtureCalendarSource
+from gated_scheduler.sources.google import CalendarClient, GoogleCalendarSource, build_google_client
 from gated_scheduler.viz.html import render_html
 
 _TIER_LABELS = {EASY: "easy", MEDIUM: "medium", HARD: "hard"}
+
+
+class _SourceError(Exception):
+    """A user-facing problem building the calendar source (bad flags, missing file)."""
+
+
+def _load_google_client(credentials: str) -> CalendarClient:
+    """Load Google credentials from a JSON path and build a live client.
+
+    Isolated behind one function so tests can monkeypatch it with a fake (no network, no creds),
+    and so the optional ``google`` dependency is imported only when actually scheduling live.
+    """
+    try:
+        from google.oauth2.service_account import (  # noqa: PLC0415  (lazy: optional dependency)
+            Credentials,
+        )
+    except ImportError as error:  # pragma: no cover - exercised only without the extra installed
+        raise _SourceError(
+            "Google support requires the 'google' extra: pip install 'gated-scheduler[google]'"
+        ) from error
+
+    scopes = ["https://www.googleapis.com/auth/calendar.readonly"]
+    creds = Credentials.from_service_account_file(credentials, scopes=scopes)
+    return build_google_client(creds)
+
+
+def _build_source(args: argparse.Namespace) -> CalendarSource:
+    if args.source == "google":
+        if not args.calendars:
+            raise _SourceError("--source google requires --calendars (comma-separated ids)")
+        if not args.credentials:
+            raise _SourceError("--source google requires --credentials (path to JSON)")
+        calendar_ids = [c.strip() for c in args.calendars.split(",") if c.strip()]
+        client = _load_google_client(args.credentials)
+        return GoogleCalendarSource(
+            client, calendar_ids, tentative_is_busy=not args.tentative_free
+        )
+
+    if not args.fixtures:
+        raise _SourceError("--source fixtures requires --fixtures (path to JSON)")
+    fixtures = Path(args.fixtures)
+    if not fixtures.exists():
+        raise _SourceError(f"fixtures file not found: {fixtures}")
+    return FixtureCalendarSource.from_file(fixtures, tentative_is_busy=not args.tentative_free)
 
 
 def _fmt(dt: datetime, tz: tzinfo) -> str:
@@ -60,8 +106,20 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Find a meeting time everyone is free for, via multi-party PSI.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
-    run = sub.add_parser("run", help="Schedule over a JSON fixtures file.")
-    run.add_argument("--fixtures", required=True, help="path to the calendars JSON file")
+    run = sub.add_parser("run", help="Schedule over fixture or live Google calendars.")
+    run.add_argument(
+        "--source",
+        choices=["fixtures", "google"],
+        default="fixtures",
+        help="calendar source (default: fixtures)",
+    )
+    run.add_argument("--fixtures", help="path to the calendars JSON file (--source fixtures)")
+    run.add_argument(
+        "--calendars", help="comma-separated calendar ids/emails (--source google)"
+    )
+    run.add_argument(
+        "--credentials", help="path to Google credentials JSON (--source google)"
+    )
     run.add_argument("--window", required=True, help="START..END, ISO date or datetime")
     run.add_argument("--slot-minutes", type=int, default=15, help="grid granularity (default 15)")
     run.add_argument("--hours", default=None, help="working hours, e.g. 9-18 (optional)")
@@ -107,18 +165,25 @@ def _run(args: argparse.Namespace) -> int:
         print(f"error: {error}", file=sys.stderr)
         return 2
 
-    fixtures = Path(args.fixtures)
-    if not fixtures.exists():
-        print(f"error: fixtures file not found: {fixtures}", file=sys.stderr)
+    try:
+        source = _build_source(args)
+    except _SourceError as error:
+        print(f"error: {error}", file=sys.stderr)
         return 2
-    source = FixtureCalendarSource.from_file(fixtures, tentative_is_busy=not args.tentative_free)
 
     duration = args.duration if args.duration is not None else args.slot_minutes
     try:
         slots_needed = slots_for_duration(duration, grid)
         rng = random.Random(args.seed) if args.seed is not None else None
         report: ScheduleResult | TieredScheduleResult
-        if source.has_reschedulable_meetings():
+        # Fixtures know whether any meeting is reschedulable (selects the single-round fast path);
+        # Google calendars don't expose that cheaply, so they always take the tiered path (which
+        # subsumes round 1 -- it just stops there when round 1 already matches).
+        tiered = (
+            not isinstance(source, FixtureCalendarSource)
+            or source.has_reschedulable_meetings()
+        )
+        if tiered:
             report = schedule_tiered(source, grid, slots_needed=slots_needed, rng=rng)
             _print_tiered_report(report, tz)
         else:
