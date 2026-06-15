@@ -209,7 +209,7 @@ def test_run_with_google_source(tmp_path, capsys, monkeypatch) -> None:
             "carol@x.com": [gbusy(9, 10), gbusy(11, 12)],  # free 10
         }
     )
-    monkeypatch.setattr(cli, "_load_google_client", lambda credentials: fake)
+    monkeypatch.setattr(cli, "_load_google_client", lambda credentials, **kw: fake)
     code = main(
         [
             "run",
@@ -231,6 +231,42 @@ def test_run_with_google_source(tmp_path, capsys, monkeypatch) -> None:
     printed = capsys.readouterr().out
     assert "10:00" in printed  # the one common slot
     assert "blinded" in printed and "CLEARTEXT" in printed  # privacy trace intact
+
+
+def test_google_oauth_flag_forwarded_to_loader(tmp_path, capsys, monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_loader(credentials, *, auth, token_path):
+        captured["credentials"] = credentials
+        captured["auth"] = auth
+        captured["token_path"] = token_path
+        return _FakeGoogleClient({"alice@x.com": [], "bob@x.com": []})
+
+    monkeypatch.setattr(cli, "_load_google_client", fake_loader)
+    code = main(
+        [
+            "run",
+            "--source",
+            "google",
+            "--calendars",
+            "alice@x.com,bob@x.com",
+            "--credentials",
+            str(tmp_path / "client_secret.json"),
+            "--auth",
+            "oauth",
+            "--token",
+            str(tmp_path / "token.json"),
+            "--window",
+            "2026-06-15..2026-06-16",
+            "--hours",
+            "9-12",
+            "--slot-minutes",
+            "60",
+        ]
+    )
+    assert code == 0
+    assert captured["auth"] == "oauth"
+    assert captured["token_path"] == str(tmp_path / "token.json")
 
 
 def test_google_source_requires_calendars(tmp_path, capsys) -> None:

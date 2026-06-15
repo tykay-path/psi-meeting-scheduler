@@ -12,6 +12,7 @@ import sys
 import webbrowser
 from datetime import datetime, tzinfo
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from gated_scheduler.freebusy import EASY, HARD, MEDIUM
@@ -36,24 +37,60 @@ class _SourceError(Exception):
     """A user-facing problem building the calendar source (bad flags, missing file)."""
 
 
-def _load_google_client(credentials: str) -> CalendarClient:
+_CAL_SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
+
+
+def _load_google_client(
+    credentials: str, *, auth: str = "service-account", token_path: str | None = None
+) -> CalendarClient:
     """Load Google credentials from a JSON path and build a live client.
 
     Isolated behind one function so tests can monkeypatch it with a fake (no network, no creds),
     and so the optional ``google`` dependency is imported only when actually scheduling live.
+    ``auth="oauth"`` runs an interactive installed-app consent flow (for a personal account with no
+    Workspace admin), caching the user token at ``token_path`` for reuse.
     """
     try:
-        from google.oauth2.service_account import (  # noqa: PLC0415  (lazy: optional dependency)
-            Credentials,
-        )
-    except ImportError as error:  # pragma: no cover - exercised only without the extra installed
+        if auth == "oauth":
+            creds = _oauth_user_credentials(credentials, token_path)
+        else:
+            from google.oauth2.service_account import (  # noqa: PLC0415  (lazy: optional dep)
+                Credentials,
+            )
+
+            creds = Credentials.from_service_account_file(credentials, scopes=_CAL_SCOPES)
+    except ImportError as error:  # pragma: no cover - only without the extra installed
         raise _SourceError(
             "Google support requires the 'google' extra: pip install 'gated-scheduler[google]'"
         ) from error
-
-    scopes = ["https://www.googleapis.com/auth/calendar.readonly"]
-    creds = Credentials.from_service_account_file(credentials, scopes=scopes)
     return build_google_client(creds)
+
+
+def _oauth_user_credentials(client_secrets: str, token_path: str | None) -> Any:  # pragma: no cover
+    """Interactive OAuth: reuse a cached token if valid, else run the consent flow once.
+
+    Glue over ``google-auth-oauthlib``; not unit-tested (it opens a browser), matching how the
+    live API adapter in ``sources/google.py`` is treated.
+    """
+    import os  # noqa: PLC0415
+
+    from google.auth.transport.requests import Request  # noqa: PLC0415
+    from google.oauth2.credentials import Credentials as UserCredentials  # noqa: PLC0415
+    from google_auth_oauthlib.flow import InstalledAppFlow  # noqa: PLC0415
+
+    creds = None
+    if token_path and os.path.exists(token_path):
+        creds = UserCredentials.from_authorized_user_file(token_path, _CAL_SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(client_secrets, _CAL_SCOPES)
+            creds = flow.run_local_server(port=0)
+        if token_path:
+            with open(token_path, "w") as handle:
+                handle.write(creds.to_json())
+    return creds
 
 
 def _build_source(args: argparse.Namespace) -> CalendarSource:
@@ -63,7 +100,9 @@ def _build_source(args: argparse.Namespace) -> CalendarSource:
         if not args.credentials:
             raise _SourceError("--source google requires --credentials (path to JSON)")
         calendar_ids = [c.strip() for c in args.calendars.split(",") if c.strip()]
-        client = _load_google_client(args.credentials)
+        client = _load_google_client(
+            args.credentials, auth=args.auth, token_path=args.token
+        )
         return GoogleCalendarSource(
             client, calendar_ids, tentative_is_busy=not args.tentative_free
         )
@@ -118,7 +157,19 @@ def _build_parser() -> argparse.ArgumentParser:
         "--calendars", help="comma-separated calendar ids/emails (--source google)"
     )
     run.add_argument(
-        "--credentials", help="path to Google credentials JSON (--source google)"
+        "--credentials",
+        help="path to Google credentials JSON: a service-account key, or an OAuth "
+        "client-secrets file when --auth oauth (--source google)",
+    )
+    run.add_argument(
+        "--auth",
+        choices=["service-account", "oauth"],
+        default="service-account",
+        help="Google auth flow (--source google; default: service-account)",
+    )
+    run.add_argument(
+        "--token",
+        help="path to cache/read the OAuth user token (--auth oauth)",
     )
     run.add_argument("--window", required=True, help="START..END, ISO date or datetime")
     run.add_argument("--slot-minutes", type=int, default=15, help="grid granularity (default 15)")

@@ -58,5 +58,5 @@ no_implicit_optional = true
 
 [[tool.mypy.overrides]]
 # nacl ships no stubs; google libs are an optional extra, lazy-imported in the live adapter only.
-module = ["nacl.*", "googleapiclient.*", "google.*"]
+module = ["nacl.*", "googleapiclient.*", "google.*", "google_auth_oauthlib.*"]
 ignore_missing_imports = true
